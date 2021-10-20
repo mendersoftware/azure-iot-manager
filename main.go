@@ -75,7 +75,7 @@ func doMain(args []string) {
 				1)
 		}
 
-		// Enable setting config values by environment variables
+		// Enable setting configuration values by environment variables
 		config.Config.SetEnvPrefix("AZURE_IOT_MANAGER")
 		config.Config.AutomaticEnv()
 		config.Config.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
