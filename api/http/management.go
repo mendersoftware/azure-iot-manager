@@ -15,7 +15,9 @@
 package http
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -189,11 +191,22 @@ func (h *ManagementHandler) GetDeviceTwin(c *gin.Context) {
 
 // PATCH /device/:id/twin
 func (h *ManagementHandler) UpdateDeviceTwin(c *gin.Context) {
-	h.proxyAzureRequest(c, AzureURIDeviceTwin.URI(c.Param("id")))
-}
-
-// PUT /device/:id/twin
-func (h *ManagementHandler) SetDeviceTwin(c *gin.Context) {
+	var desiredProps struct {
+		Properties struct {
+			Desired map[string]interface{} `json:"desired"`
+		} `json:"properties"`
+	}
+	err := c.ShouldBindJSON(&desiredProps.Properties.Desired)
+	c.Request.Body.Close()
+	if err != nil {
+		rest.RenderError(c, http.StatusBadRequest, errors.Wrap(err,
+			"malformed request body",
+		))
+		return
+	}
+	b, _ := json.Marshal(desiredProps)
+	c.Request.Body = io.NopCloser(bytes.NewReader(b))
+	c.Request.ContentLength = int64(len(b))
 	h.proxyAzureRequest(c, AzureURIDeviceTwin.URI(c.Param("id")))
 }
 

@@ -671,9 +671,9 @@ func TestProxyAzureRequest(t *testing.T) {
 					// Check that body matches
 					if r.Body != nil {
 						rb, _ := io.ReadAll(r.Body)
-						assert.Equal(t,
-							string(bodyCopy),
+						assert.Contains(t,
 							string(rb),
+							string(bodyCopy),
 							"Proxy request body does not match",
 						)
 					}
