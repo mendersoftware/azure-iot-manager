@@ -16,7 +16,6 @@ package server
 
 import (
 	"context"
-	"github.com/mendersoftware/azure-iot-manager/store"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,23 +28,28 @@ import (
 
 	api "github.com/mendersoftware/azure-iot-manager/api/http"
 	"github.com/mendersoftware/azure-iot-manager/app"
+	"github.com/mendersoftware/azure-iot-manager/client/iothub"
+	"github.com/mendersoftware/azure-iot-manager/client/workflows"
 	dconfig "github.com/mendersoftware/azure-iot-manager/config"
+	"github.com/mendersoftware/azure-iot-manager/store"
 )
 
 // InitAndRun initializes the server and runs it
 func InitAndRun(conf config.Reader, dataStore store.DataStore) error {
 	ctx := context.Background()
+	httpClient := new(http.Client)
+	wf := workflows.NewClient(
+		conf.GetString(dconfig.SettingWorkflowsURL),
+		workflows.NewOptions().SetClient(httpClient),
+	)
+	hub := iothub.NewClient(iothub.NewOptions().SetClient(httpClient))
 
 	log.Setup(conf.GetBool(dconfig.SettingDebugLog))
 	l := log.FromContext(ctx)
 
-	config := app.Config{}
-	azureIotManagerApp := app.New(config, dataStore)
+	azureIotManagerApp := app.New(dataStore, hub, wf)
 
-	router, err := api.NewRouter(azureIotManagerApp)
-	if err != nil {
-		l.Fatal(err)
-	}
+	router := api.NewRouter(azureIotManagerApp, api.NewConfig().SetClient(httpClient))
 
 	var listen = conf.GetString(dconfig.SettingListen)
 	srv := &http.Server{

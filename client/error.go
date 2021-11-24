@@ -12,17 +12,16 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
-package model
+package client
 
-import validation "github.com/go-ozzo/ozzo-validation/v4"
+import (
+	"fmt"
+)
 
-//nolint:lll
-type Settings struct {
-	ConnectionString *ConnectionString `json:"connection_string,omitempty" bson:"connection_string,omitempty"`
+type HTTPError struct {
+	Code int
 }
 
-func (s Settings) Validate() error {
-	return validation.ValidateStruct(&s,
-		validation.Field(&s.ConnectionString),
-	)
+func (err HTTPError) Error() string {
+	return fmt.Sprintf("iothub: unexpected status code from API: %d", err.Code)
 }
