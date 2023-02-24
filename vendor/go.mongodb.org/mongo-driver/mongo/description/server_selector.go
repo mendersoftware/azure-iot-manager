@@ -130,10 +130,20 @@ func WriteSelector() ServerSelector {
 
 // ReadPrefSelector selects servers based on the provided read preference.
 func ReadPrefSelector(rp *readpref.ReadPref) ServerSelector {
+	return readPrefSelector(rp, false)
+}
+
+// OutputAggregateSelector selects servers based on the provided read preference given that the underlying operation is
+// aggregate with an output stage.
+func OutputAggregateSelector(rp *readpref.ReadPref) ServerSelector {
+	return readPrefSelector(rp, true)
+}
+
+func readPrefSelector(rp *readpref.ReadPref, isOutputAggregate bool) ServerSelector {
 	return ServerSelectorFunc(func(t Topology, candidates []Server) ([]Server, error) {
 		if t.Kind == LoadBalanced {
 			// In LoadBalanced mode, there should only be one server in the topology and it must be selected. We check
-			// this before checking MaxStaleness support becuase there's no monitoring in this mode, so the candidate
+			// this before checking MaxStaleness support because there's no monitoring in this mode, so the candidate
 			// server wouldn't have a wire version set, which would result in an error.
 			return candidates, nil
 		}
@@ -152,7 +162,7 @@ func ReadPrefSelector(rp *readpref.ReadPref) ServerSelector {
 		case Single:
 			return candidates, nil
 		case ReplicaSetNoPrimary, ReplicaSetWithPrimary:
-			return selectForReplicaSet(rp, t, candidates)
+			return selectForReplicaSet(rp, isOutputAggregate, t, candidates)
 		case Sharded:
 			return selectByKind(candidates, Mongos), nil
 		}
@@ -170,9 +180,19 @@ func maxStalenessSupported(wireVersion *VersionRange) error {
 	return nil
 }
 
-func selectForReplicaSet(rp *readpref.ReadPref, t Topology, candidates []Server) ([]Server, error) {
+func selectForReplicaSet(rp *readpref.ReadPref, isOutputAggregate bool, t Topology, candidates []Server) ([]Server, error) {
 	if err := verifyMaxStaleness(rp, t); err != nil {
 		return nil, err
+	}
+
+	// If underlying operation is an aggregate with an output stage, only apply read preference
+	// if all candidates are 5.0+. Otherwise, operate under primary read preference.
+	if isOutputAggregate {
+		for _, s := range candidates {
+			if s.WireVersion.Max < 13 {
+				return selectByKind(candidates, RSPrimary), nil
+			}
+		}
 	}
 
 	switch rp.Mode() {
@@ -276,13 +296,18 @@ func selectByTagSet(candidates []Server, tagSets []tag.Set) []Server {
 }
 
 func selectByKind(candidates []Server, kind ServerKind) []Server {
-	var result []Server
-	for _, s := range candidates {
+	// Record the indices of viable candidates first and then append those to the returned slice
+	// to avoid appending costly Server structs directly as an optimization.
+	viableIndexes := make([]int, 0, len(candidates))
+	for i, s := range candidates {
 		if s.Kind == kind {
-			result = append(result, s)
+			viableIndexes = append(viableIndexes, i)
 		}
 	}
-
+	result := make([]Server, len(viableIndexes))
+	for i, idx := range viableIndexes {
+		result[i] = candidates[idx]
+	}
 	return result
 }
 

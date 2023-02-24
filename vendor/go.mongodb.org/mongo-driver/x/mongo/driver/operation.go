@@ -1,3 +1,9 @@
+// Copyright (C) MongoDB, Inc. 2022-present.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License. You may obtain
+// a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+
 package driver
 
 import (
@@ -7,12 +13,14 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/event"
+	"go.mongodb.org/mongo-driver/internal"
 	"go.mongodb.org/mongo-driver/mongo/description"
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
@@ -46,6 +54,17 @@ const (
 	readSnapshotMinWireVersion int32 = 13
 )
 
+// RetryablePoolError is a connection pool error that can be retried while executing an operation.
+type RetryablePoolError interface {
+	Retryable() bool
+}
+
+// labeledError is an error that can have error labels added to it.
+type labeledError interface {
+	error
+	HasErrorLabel(string) bool
+}
+
 // InvalidOperationError is returned from Validate and indicates that a required field is missing
 // from an instance of Operation.
 type InvalidOperationError struct{ MissingField string }
@@ -72,20 +91,22 @@ type startedInformation struct {
 	cmdName                  string
 	documentSequenceIncluded bool
 	connID                   string
+	serverConnID             *int32
 	redacted                 bool
 	serviceID                *primitive.ObjectID
 }
 
 // finishedInformation keeps track of all of the information necessary for monitoring success and failure events.
 type finishedInformation struct {
-	cmdName   string
-	requestID int32
-	response  bsoncore.Document
-	cmdErr    error
-	connID    string
-	startTime time.Time
-	redacted  bool
-	serviceID *primitive.ObjectID
+	cmdName      string
+	requestID    int32
+	response     bsoncore.Document
+	cmdErr       error
+	connID       string
+	serverConnID *int32
+	startTime    time.Time
+	redacted     bool
+	serviceID    *primitive.ObjectID
 }
 
 // ResponseInfo contains the context required to parse a server response.
@@ -171,6 +192,8 @@ type Operation struct {
 	// RetryMode specifies how to retry. There are three modes that enable retry: RetryOnce,
 	// RetryOncePerCommand, and RetryContext. For more information about what these modes do, please
 	// refer to their definitions. Both RetryMode and Type must be set for retryability to be enabled.
+	// If Timeout is set on the Client, the operation will automatically retry as many times as
+	// possible unless RetryNone is used.
 	RetryMode *RetryMode
 
 	// Type specifies the kind of operation this is. There is only one mode that enables retry: Write.
@@ -194,10 +217,21 @@ type Operation struct {
 	CommandMonitor *event.CommandMonitor
 
 	// Crypt specifies a Crypt object to use for automatic client side encryption and decryption.
-	Crypt *Crypt
+	Crypt Crypt
 
 	// ServerAPI specifies options used to configure the API version sent to the server.
 	ServerAPI *ServerAPIOptions
+
+	// IsOutputAggregate specifies whether this operation is an aggregate with an output stage. If true,
+	// read preference will not be added to the command on wire versions < 13.
+	IsOutputAggregate bool
+
+	// MaxTime specifies the maximum amount of time to allow the operation to run on the server.
+	MaxTime *time.Duration
+
+	// Timeout is the amount of time that this operation can execute before returning an error. The default value
+	// nil, which means that the timeout of the operation's caller will be used.
+	Timeout *time.Duration
 
 	// cmdName is only set when serializing OP_MSG and is used internally in readWireMessage.
 	cmdName string
@@ -205,7 +239,7 @@ type Operation struct {
 
 // shouldEncrypt returns true if this operation should automatically be encrypted.
 func (op Operation) shouldEncrypt() bool {
-	return op.Crypt != nil && !op.Crypt.BypassAutoEncryption
+	return op.Crypt != nil && !op.Crypt.BypassAutoEncryption()
 }
 
 // selectServer handles performing server selection for an operation.
@@ -284,12 +318,30 @@ func (op Operation) Validate() error {
 	return nil
 }
 
-// Execute runs this operation. The scratch parameter will be used and overwritten (potentially many
-// times), this should mainly be used to enable pooling of byte slices.
-func (op Operation) Execute(ctx context.Context, scratch []byte) error {
+var memoryPool = sync.Pool{
+	New: func() interface{} {
+		// Start with 1kb buffers.
+		b := make([]byte, 1024)
+		// Return a pointer as the static analysis tool suggests.
+		return &b
+	},
+}
+
+// Execute runs this operation.
+func (op Operation) Execute(ctx context.Context) error {
 	err := op.Validate()
 	if err != nil {
 		return err
+	}
+
+	// If no deadline is set on the passed-in context, op.Timeout is set, and context is not already
+	// a Timeout context, honor op.Timeout in new Timeout context for operation execution.
+	if _, deadlineSet := ctx.Deadline(); !deadlineSet && op.Timeout != nil && !internal.IsTimeoutContext(ctx) {
+		newCtx, cancelFunc := internal.MakeTimeoutContext(ctx, *op.Timeout)
+		// Redefine ctx to be the new timeout-derived context.
+		ctx = newCtx
+		// Cancel the timeout-derived context at the end of Execute to avoid a context leak.
+		defer cancelFunc()
 	}
 
 	if op.Client != nil {
@@ -298,40 +350,8 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 		}
 	}
 
-	srvr, conn, err := op.getServerAndConnection(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	desc := description.SelectedServer{Server: conn.Description(), Kind: op.Deployment.Kind()}
-	scratch = scratch[:0]
-
-	if desc.WireVersion == nil || desc.WireVersion.Max < 4 {
-		switch op.Legacy {
-		case LegacyFind:
-			return op.legacyFind(ctx, scratch, srvr, conn, desc)
-		case LegacyGetMore:
-			return op.legacyGetMore(ctx, scratch, srvr, conn, desc)
-		case LegacyKillCursors:
-			return op.legacyKillCursors(ctx, scratch, srvr, conn, desc)
-		}
-	}
-	if desc.WireVersion == nil || desc.WireVersion.Max < 3 {
-		switch op.Legacy {
-		case LegacyListCollections:
-			return op.legacyListCollections(ctx, scratch, srvr, conn, desc)
-		case LegacyListIndexes:
-			return op.legacyListIndexes(ctx, scratch, srvr, conn, desc)
-		}
-	}
-
-	var res bsoncore.Document
-	var operationErr WriteCommandError
-	var original error
 	var retries int
-	retryable := op.retryable(desc.Server)
-	if retryable && op.RetryMode != nil {
+	if op.RetryMode != nil {
 		switch op.Type {
 		case Write:
 			if op.Client == nil {
@@ -343,15 +363,6 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 			case RetryContext:
 				retries = -1
 			}
-
-			op.Client.RetryWrite = false
-			if *op.RetryMode > RetryNone {
-				op.Client.RetryWrite = true
-				if !op.Client.Committing && !op.Client.Aborting {
-					op.Client.IncrementTxnNumber()
-				}
-			}
-
 		case Read:
 			switch *op.RetryMode {
 			case RetryOnce, RetryOncePerCommand:
@@ -361,10 +372,151 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 			}
 		}
 	}
-	batching := op.Batches.Valid()
+	// If context is a Timeout context, automatically set retries to -1 (infinite) if retrying is
+	// enabled.
 	retryEnabled := op.RetryMode != nil && op.RetryMode.Enabled()
+	if internal.IsTimeoutContext(ctx) && retryEnabled {
+		retries = -1
+	}
+
+	var srvr Server
+	var conn Connection
+	var res bsoncore.Document
+	var operationErr WriteCommandError
+	var prevErr error
+	var prevIndefiniteErr error
+	batching := op.Batches.Valid()
+	retrySupported := false
+	first := true
 	currIndex := 0
+
+	// resetForRetry records the error that caused the retry, decrements retries, and resets the
+	// retry loop variables to request a new server and a new connection for the next attempt.
+	resetForRetry := func(err error) {
+		retries--
+		prevErr = err
+
+		// Set the previous indefinite error to be returned in any case where a retryable write error does not have a
+		// NoWritesPerfomed label (the definite case).
+		switch err := err.(type) {
+		case labeledError:
+			// If the "prevIndefiniteErr" is nil, then the current error is the first error encountered
+			// during the retry attempt cycle. We must persist the first error in the case where all
+			// following errors are labeled "NoWritesPerformed", which would otherwise raise nil as the
+			// error.
+			if prevIndefiniteErr == nil {
+				prevIndefiniteErr = err
+			}
+
+			// If the error is not labeled NoWritesPerformed and is retryable, then set the previous
+			// indefinite error to be the current error.
+			if !err.HasErrorLabel(NoWritesPerformed) && err.HasErrorLabel(RetryableWriteError) {
+				prevIndefiniteErr = err
+			}
+		}
+
+		// If we got a connection, close it immediately to release pool resources for
+		// subsequent retries.
+		if conn != nil {
+			conn.Close()
+		}
+		// Set the server and connection to nil to request a new server and connection.
+		srvr = nil
+		conn = nil
+	}
+
+	wm := memoryPool.Get().(*[]byte)
+	defer func() {
+		// Proper usage of a sync.Pool requires each entry to have approximately the same memory
+		// cost. To obtain this property when the stored type contains a variably-sized buffer,
+		// we add a hard limit on the maximum buffer to place back in the pool. We limit the
+		// size to 16MiB because that's the maximum wire message size supported by MongoDB.
+		//
+		// Comment copied from https://cs.opensource.google/go/go/+/refs/tags/go1.19:src/fmt/print.go;l=147
+		if cap(*wm) > 16*1024*1024 {
+			return
+		}
+		memoryPool.Put(wm)
+	}()
 	for {
+		// If the server or connection are nil, try to select a new server and get a new connection.
+		if srvr == nil || conn == nil {
+			srvr, conn, err = op.getServerAndConnection(ctx)
+			if err != nil {
+				// If the returned error is retryable and there are retries remaining (negative
+				// retries means retry indefinitely), then retry the operation. Set the server
+				// and connection to nil to request a new server and connection.
+				if rerr, ok := err.(RetryablePoolError); ok && rerr.Retryable() && retries != 0 {
+					resetForRetry(err)
+					continue
+				}
+
+				// If this is a retry and there's an error from a previous attempt, return the previous
+				// error instead of the current connection error.
+				if prevErr != nil {
+					return prevErr
+				}
+				return err
+			}
+			defer conn.Close()
+
+			// Set the server if it has not already been set and the session type is implicit. This will
+			// limit the number of implicit sessions to no greater than an application's maxPoolSize
+			// (ignoring operations that hold on to the session like cursors).
+			if op.Client != nil && op.Client.Server == nil && op.Client.IsImplicit {
+				if op.Client.Terminated {
+					return fmt.Errorf("unexpected nil session for a terminated implicit session")
+				}
+				if err := op.Client.SetServer(); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Run steps that must only be run on the first attempt, but not again for retries.
+		if first {
+			// Determine if retries are supported for the current operation on the current server
+			// description. Per the retryable writes specification, only determine this for the
+			// first server selected:
+			//
+			//   If the server selected for the first attempt of a retryable write operation does
+			//   not support retryable writes, drivers MUST execute the write as if retryable writes
+			//   were not enabled.
+			retrySupported = op.retryable(conn.Description())
+
+			// If retries are supported for the current operation on the current server description,
+			// client retries are enabled, the operation type is write, and we haven't incremented
+			// the txn number yet, enable retry writes on the session and increment the txn number.
+			// Calling IncrementTxnNumber() for server descriptions or topologies that do not
+			// support retries (e.g. standalone topologies) will cause server errors. Only do this
+			// check for the first attempt to keep retried writes in the same transaction.
+			if retrySupported && op.RetryMode != nil && op.Type == Write && op.Client != nil {
+				op.Client.RetryWrite = false
+				if op.RetryMode.Enabled() {
+					op.Client.RetryWrite = true
+					if !op.Client.Committing && !op.Client.Aborting {
+						op.Client.IncrementTxnNumber()
+					}
+				}
+			}
+
+			first = false
+		}
+
+		// Calculate maxTimeMS value to potentially be appended to the wire message.
+		maxTimeMS, err := op.calculateMaxTimeMS(ctx, srvr.RTTMonitor().P90(), srvr.RTTMonitor().Stats())
+		if err != nil {
+			return err
+		}
+
+		// Set maxTimeMS to 0 if connected to mongocryptd to avoid appending the field. The final
+		// encrypted command may contain multiple maxTimeMS fields otherwise.
+		if conn.Description().IsCryptd {
+			maxTimeMS = 0
+		}
+
+		desc := description.SelectedServer{Server: conn.Description(), Kind: op.Deployment.Kind()}
+
 		if batching {
 			targetBatchSize := desc.MaxDocumentSize
 			maxDocSize := desc.MaxDocumentSize
@@ -383,11 +535,8 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 			}
 		}
 
-		// convert to wire message
-		if len(scratch) > 0 {
-			scratch = scratch[:0]
-		}
-		wm, startedInfo, err := op.createWireMessage(ctx, scratch, desc, conn)
+		var startedInfo startedInformation
+		*wm, startedInfo, err = op.createWireMessage(ctx, (*wm)[:0], desc, maxTimeMS, conn)
 		if err != nil {
 			return err
 		}
@@ -398,47 +547,76 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 		op.cmdName = startedInfo.cmdName
 		startedInfo.redacted = op.redactCommand(startedInfo.cmdName, startedInfo.cmd)
 		startedInfo.serviceID = conn.Description().ServiceID
+		startedInfo.serverConnID = conn.ServerConnectionID()
 		op.publishStartedEvent(ctx, startedInfo)
 
 		// get the moreToCome flag information before we compress
-		moreToCome := wiremessage.IsMsgMoreToCome(wm)
+		moreToCome := wiremessage.IsMsgMoreToCome(*wm)
 
 		// compress wiremessage if allowed
 		if compressor, ok := conn.(Compressor); ok && op.canCompress(startedInfo.cmdName) {
-			wm, err = compressor.CompressWireMessage(wm, nil)
+			b := memoryPool.Get().(*[]byte)
+			*b, err = compressor.CompressWireMessage(*wm, (*b)[:0])
+			memoryPool.Put(wm)
+			wm = b
 			if err != nil {
 				return err
 			}
 		}
 
 		finishedInfo := finishedInformation{
-			cmdName:   startedInfo.cmdName,
-			requestID: startedInfo.requestID,
-			startTime: time.Now(),
-			connID:    startedInfo.connID,
-			redacted:  startedInfo.redacted,
-			serviceID: startedInfo.serviceID,
+			cmdName:      startedInfo.cmdName,
+			requestID:    startedInfo.requestID,
+			startTime:    time.Now(),
+			connID:       startedInfo.connID,
+			serverConnID: startedInfo.serverConnID,
+			redacted:     startedInfo.redacted,
+			serviceID:    startedInfo.serviceID,
 		}
 
-		// roundtrip using either the full roundTripper or a special one for when the moreToCome
-		// flag is set
-		var roundTrip = op.roundTrip
-		if moreToCome {
-			roundTrip = op.moreToComeRoundTrip
+		// Check for possible context error. If no context error, check if there's enough time to perform a
+		// round trip before the Context deadline. If ctx is a Timeout Context, use the 90th percentile RTT
+		// as a threshold. Otherwise, use the minimum observed RTT.
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		} else if deadline, ok := ctx.Deadline(); ok {
+			if internal.IsTimeoutContext(ctx) && time.Now().Add(srvr.RTTMonitor().P90()).After(deadline) {
+				err = internal.WrapErrorf(ErrDeadlineWouldBeExceeded,
+					"remaining time %v until context deadline is less than 90th percentile RTT\n%v", time.Until(deadline), srvr.RTTMonitor().Stats())
+			} else if time.Now().Add(srvr.RTTMonitor().Min()).After(deadline) {
+				err = context.DeadlineExceeded
+			}
 		}
-		res, err = roundTrip(ctx, conn, wm)
-		if ep, ok := srvr.(ErrorProcessor); ok {
-			_ = ep.ProcessError(err, conn)
+
+		if err == nil {
+			// roundtrip using either the full roundTripper or a special one for when the moreToCome
+			// flag is set
+			var roundTrip = op.roundTrip
+			if moreToCome {
+				roundTrip = op.moreToComeRoundTrip
+			}
+			res, *wm, err = roundTrip(ctx, conn, *wm)
+
+			if ep, ok := srvr.(ErrorProcessor); ok {
+				_ = ep.ProcessError(err, conn)
+			}
 		}
 
 		finishedInfo.response = res
 		finishedInfo.cmdErr = err
 		op.publishFinishedEvent(ctx, finishedInfo)
 
+		// prevIndefiniteErrorIsSet is "true" if the "err" variable has been set to the "prevIndefiniteErr" in
+		// a case in the switch statement below.
+		var prevIndefiniteErrIsSet bool
+
+		// TODO(GODRIVER-2579): When refactoring the "Execute" method, consider creating a separate method for the
+		// error handling logic below. This will remove the necessity of the "checkError" goto label.
+	checkError:
 		var perr error
 		switch tt := err.(type) {
 		case WriteCommandError:
-			if e := err.(WriteCommandError); retryable && op.Type == Write && e.UnsupportedStorageEngine() {
+			if e := err.(WriteCommandError); retrySupported && op.Type == Write && e.UnsupportedStorageEngine() {
 				return ErrUnsupportedStorageEngine
 			}
 
@@ -453,24 +631,27 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 				tt.Labels = append(tt.Labels, RetryableWriteError)
 			}
 
-			if retryable && retryableErr && retries != 0 {
-				retries--
-				original, err = err, nil
-				conn.Close() // Avoid leaking the connection.
-				srvr, conn, err = op.getServerAndConnection(ctx)
-				if err != nil || conn == nil || !op.retryable(conn.Description()) {
-					if conn != nil {
-						conn.Close()
-					}
-					return original
-				}
-				defer conn.Close() // Avoid leaking the new connection.
+			// If retries are supported for the current operation on the first server description,
+			// the error is considered retryable, and there are retries remaining (negative retries
+			// means retry indefinitely), then retry the operation.
+			if retrySupported && retryableErr && retries != 0 {
 				if op.Client != nil && op.Client.Committing {
 					// Apply majority write concern for retries
 					op.Client.UpdateCommitTransactionWriteConcern()
 					op.WriteConcern = op.Client.CurrentWc
 				}
+				resetForRetry(tt)
 				continue
+			}
+
+			// If the error is no longer retryable and has the NoWritesPerformed label, then we should
+			// set the error to the "previous indefinite error" unless the current error is already the
+			// "previous indefinite error". After reseting, repeat the error check.
+			if tt.HasErrorLabel(NoWritesPerformed) && !prevIndefiniteErrIsSet {
+				err = prevIndefiniteErr
+				prevIndefiniteErrIsSet = true
+
+				goto checkError
 			}
 
 			// If the operation isn't being retried, process the response
@@ -482,7 +663,7 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 					ConnectionDescription: desc.Server,
 					CurrentIndex:          currIndex,
 				}
-				perr = op.ProcessResponseFn(info)
+				_ = op.ProcessResponseFn(info)
 			}
 
 			if batching && len(tt.WriteErrors) > 0 && currIndex > 0 {
@@ -493,7 +674,7 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 
 			// If batching is enabled and either ordered is the default (which is true) or
 			// explicitly set to true and we have write errors, return the errors.
-			if batching && (op.Batches.Ordered == nil || *op.Batches.Ordered == true) && len(tt.WriteErrors) > 0 {
+			if batching && (op.Batches.Ordered == nil || *op.Batches.Ordered) && len(tt.WriteErrors) > 0 {
 				return tt
 			}
 			if op.Client != nil && op.Client.Committing && tt.WriteConcernError != nil {
@@ -503,6 +684,7 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 					Code:    int32(tt.WriteConcernError.Code),
 					Message: tt.WriteConcernError.Message,
 					Labels:  tt.Labels,
+					Raw:     tt.Raw,
 				}
 				// The UnknownTransactionCommitResult label is added to all writeConcernErrors besides unknownReplWriteConcernCode
 				// and unsatisfiableWriteConcernCode
@@ -517,13 +699,15 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 			operationErr.WriteConcernError = tt.WriteConcernError
 			operationErr.WriteErrors = append(operationErr.WriteErrors, tt.WriteErrors...)
 			operationErr.Labels = tt.Labels
+			operationErr.Raw = tt.Raw
 		case Error:
 			if tt.HasErrorLabel(TransientTransactionError) || tt.HasErrorLabel(UnknownTransactionCommitResult) {
 				if err := op.Client.ClearPinnedResources(); err != nil {
 					return err
 				}
 			}
-			if e := err.(Error); retryable && op.Type == Write && e.UnsupportedStorageEngine() {
+
+			if e := err.(Error); retrySupported && op.Type == Write && e.UnsupportedStorageEngine() {
 				return ErrUnsupportedStorageEngine
 			}
 
@@ -544,24 +728,27 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 				retryableErr = tt.RetryableRead()
 			}
 
-			if retryable && retryableErr && retries != 0 {
-				retries--
-				original, err = err, nil
-				conn.Close() // Avoid leaking the connection.
-				srvr, conn, err = op.getServerAndConnection(ctx)
-				if err != nil || conn == nil || !op.retryable(conn.Description()) {
-					if conn != nil {
-						conn.Close()
-					}
-					return original
-				}
-				defer conn.Close() // Avoid leaking the new connection.
+			// If retries are supported for the current operation on the first server description,
+			// the error is considered retryable, and there are retries remaining (negative retries
+			// means retry indefinitely), then retry the operation.
+			if retrySupported && retryableErr && retries != 0 {
 				if op.Client != nil && op.Client.Committing {
 					// Apply majority write concern for retries
 					op.Client.UpdateCommitTransactionWriteConcern()
 					op.WriteConcern = op.Client.CurrentWc
 				}
+				resetForRetry(tt)
 				continue
+			}
+
+			// If the error is no longer retryable and has the NoWritesPerformed label, then we should
+			// set the error to the "previous indefinite error" unless the current error is already the
+			// "previous indefinite error". After reseting, repeat the error check.
+			if tt.HasErrorLabel(NoWritesPerformed) && !prevIndefiniteErrIsSet {
+				err = prevIndefiniteErr
+				prevIndefiniteErrIsSet = true
+
+				goto checkError
 			}
 
 			// If the operation isn't being retried, process the response
@@ -573,7 +760,7 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 					ConnectionDescription: desc.Server,
 					CurrentIndex:          currIndex,
 				}
-				perr = op.ProcessResponseFn(info)
+				_ = op.ProcessResponseFn(info)
 			}
 
 			if op.Client != nil && op.Client.Committing && (retryableErr || tt.Code == 50) {
@@ -607,17 +794,26 @@ func (op Operation) Execute(ctx context.Context, scratch []byte) error {
 					ConnectionDescription: desc.Server,
 					CurrentIndex:          currIndex,
 				}
-				perr = op.ProcessResponseFn(info)
+				_ = op.ProcessResponseFn(info)
 			}
 			return err
 		}
 
+		// If we're batching and there are batches remaining, advance to the next batch. This isn't
+		// a retry, so increment the transaction number, reset the retries number, and don't set
+		// server or connection to nil to continue using the same connection.
 		if batching && len(op.Batches.Documents) > 0 {
-			if retryable && op.Client != nil && op.RetryMode != nil {
-				if *op.RetryMode > RetryNone {
+			// If retries are supported for the current operation on the current server description,
+			// the session isn't nil, and client retries are enabled, increment the txn number.
+			// Calling IncrementTxnNumber() for server descriptions or topologies that do not
+			// support retries (e.g. standalone topologies) will cause server errors.
+			if retrySupported && op.Client != nil && op.RetryMode != nil {
+				if op.RetryMode.Enabled() {
 					op.Client.IncrementTxnNumber()
 				}
-				if *op.RetryMode == RetryOncePerCommand {
+				// Reset the retries number for RetryOncePerCommand unless context is a Timeout context, in
+				// which case retries should remain as -1 (as many times as possible).
+				if *op.RetryMode == RetryOncePerCommand && !internal.IsTimeoutContext(ctx) {
 					retries = 1
 				}
 			}
@@ -642,7 +838,6 @@ func (op Operation) retryable(desc description.Server) bool {
 			return true
 		}
 		if retryWritesSupported(desc) &&
-			desc.WireVersion != nil && desc.WireVersion.Max >= 6 &&
 			op.Client != nil && !(op.Client.TransactionInProgress() || op.Client.TransactionStarting()) &&
 			writeconcern.AckWrite(op.WriteConcern) {
 			return true
@@ -651,8 +846,7 @@ func (op Operation) retryable(desc description.Server) bool {
 		if op.Client != nil && (op.Client.Committing || op.Client.Aborting) {
 			return true
 		}
-		if desc.WireVersion != nil && desc.WireVersion.Max >= 6 &&
-			(op.Client == nil || !(op.Client.TransactionInProgress() || op.Client.TransactionStarting())) {
+		if op.Client == nil || !(op.Client.TransactionInProgress() || op.Client.TransactionStarting()) {
 			return true
 		}
 	}
@@ -661,41 +855,18 @@ func (op Operation) retryable(desc description.Server) bool {
 
 // roundTrip writes a wiremessage to the connection and then reads a wiremessage. The wm parameter
 // is reused when reading the wiremessage.
-func (op Operation) roundTrip(ctx context.Context, conn Connection, wm []byte) ([]byte, error) {
-	err := conn.WriteWireMessage(ctx, wm)
+func (op Operation) roundTrip(ctx context.Context, conn Connection, wm []byte) (result, pooledSlice []byte, err error) {
+	err = conn.WriteWireMessage(ctx, wm)
 	if err != nil {
-		labels := []string{NetworkError}
-		if op.Client != nil {
-			op.Client.MarkDirty()
-		}
-		if op.Client != nil && op.Client.TransactionRunning() && !op.Client.Committing {
-			labels = append(labels, TransientTransactionError)
-		}
-		if op.Client != nil && op.Client.Committing {
-			labels = append(labels, UnknownTransactionCommitResult)
-		}
-		return nil, Error{Message: err.Error(), Labels: labels, Wrapped: err}
+		return nil, wm, op.networkError(err)
 	}
-
 	return op.readWireMessage(ctx, conn, wm)
 }
 
-func (op Operation) readWireMessage(ctx context.Context, conn Connection, wm []byte) ([]byte, error) {
-	var err error
-
+func (op Operation) readWireMessage(ctx context.Context, conn Connection, wm []byte) (result, pooledSlice []byte, err error) {
 	wm, err = conn.ReadWireMessage(ctx, wm[:0])
 	if err != nil {
-		labels := []string{NetworkError}
-		if op.Client != nil {
-			op.Client.MarkDirty()
-		}
-		if op.Client != nil && op.Client.TransactionRunning() && !op.Client.Committing {
-			labels = append(labels, TransientTransactionError)
-		}
-		if op.Client != nil && op.Client.Committing {
-			labels = append(labels, UnknownTransactionCommitResult)
-		}
-		return nil, Error{Message: err.Error(), Labels: labels, Wrapped: err}
+		return nil, wm, op.networkError(err)
 	}
 
 	// If we're using a streamable connection, we set its streaming state based on the moreToCome flag in the server
@@ -707,11 +878,14 @@ func (op Operation) readWireMessage(ctx context.Context, conn Connection, wm []b
 	// decompress wiremessage
 	wm, err = op.decompressWireMessage(wm)
 	if err != nil {
-		return nil, err
+		return nil, wm, err
 	}
 
 	// decode
-	res, err := op.decodeResult(wm)
+	b, err := op.decodeResult(wm)
+	// Copy b to extend the lifetime. b may be a subslice of wm. wm will be added back to the memory pool and reused.
+	res := make([]byte, len(b))
+	copy(res, b)
 	// Update cluster/operation time and recovery tokens before handling the error to ensure we're properly updating
 	// everything.
 	op.updateClusterTimes(res)
@@ -724,27 +898,48 @@ func (op Operation) readWireMessage(ctx context.Context, conn Connection, wm []b
 	}
 
 	if err != nil {
-		return res, err
+		return res, wm, err
 	}
 
 	// If there is no error, automatically attempt to decrypt all results if client side encryption is enabled.
 	if op.Crypt != nil {
-		return op.Crypt.Decrypt(ctx, res)
+		res, err = op.Crypt.Decrypt(ctx, res)
 	}
-	return res, nil
+	return res, wm, err
+}
+
+// networkError wraps the provided error in an Error with label "NetworkError" and, if a transaction
+// is running or committing, the appropriate transaction state labels. The returned error indicates
+// the operation should be retried for reads and writes. If err is nil, networkError returns nil.
+func (op Operation) networkError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	labels := []string{NetworkError}
+	if op.Client != nil {
+		op.Client.MarkDirty()
+	}
+	if op.Client != nil && op.Client.TransactionRunning() && !op.Client.Committing {
+		labels = append(labels, TransientTransactionError)
+	}
+	if op.Client != nil && op.Client.Committing {
+		labels = append(labels, UnknownTransactionCommitResult)
+	}
+	return Error{Message: err.Error(), Labels: labels, Wrapped: err}
 }
 
 // moreToComeRoundTrip writes a wiremessage to the provided connection. This is used when an OP_MSG is
 // being sent with  the moreToCome bit set.
-func (op *Operation) moreToComeRoundTrip(ctx context.Context, conn Connection, wm []byte) ([]byte, error) {
-	err := conn.WriteWireMessage(ctx, wm)
+func (op *Operation) moreToComeRoundTrip(ctx context.Context, conn Connection, wm []byte) (result, pooledSlice []byte, err error) {
+	err = conn.WriteWireMessage(ctx, wm)
 	if err != nil {
 		if op.Client != nil {
 			op.Client.MarkDirty()
 		}
 		err = Error{Message: err.Error(), Labels: []string{TransientTransactionError, NetworkError}, Wrapped: err}
 	}
-	return bsoncore.BuildDocument(nil, bsoncore.AppendInt32Element(nil, "ok", 1)), err
+	return bsoncore.BuildDocument(nil, bsoncore.AppendInt32Element(nil, "ok", 1)), wm, err
 }
 
 // decompressWireMessage handles decompressing a wiremessage. If the wiremessage
@@ -774,32 +969,53 @@ func (Operation) decompressWireMessage(wm []byte) ([]byte, error) {
 	}
 	compressedSize := length - 25 // header (16) + original opcode (4) + uncompressed size (4) + compressor ID (1)
 	// return the original wiremessage
-	msg, rem, ok := wiremessage.ReadCompressedCompressedMessage(rem, compressedSize)
+	msg, _, ok := wiremessage.ReadCompressedCompressedMessage(rem, compressedSize)
 	if !ok {
 		return nil, errors.New("malformed OP_COMPRESSED: insufficient bytes for compressed wiremessage")
 	}
 
-	header := make([]byte, 0, uncompressedSize+16)
-	header = wiremessage.AppendHeader(header, uncompressedSize+16, reqid, respto, opcode)
+	// Copy msg, which is a subslice of wm. wm will be used to store the return value of the decompressed message.
+	b := memoryPool.Get().(*[]byte)
+	msglen := len(msg)
+	if len(*b) < msglen {
+		*b = make([]byte, msglen)
+	}
+	copy(*b, msg)
+	defer func() {
+		memoryPool.Put(b)
+	}()
+
+	if l := int(uncompressedSize) + 16; cap(wm) < l {
+		wm = make([]byte, 0, l)
+	}
+	wm = wiremessage.AppendHeader(wm[:0], uncompressedSize+16, reqid, respto, opcode)
 	opts := CompressionOpts{
 		Compressor:       compressorID,
 		UncompressedSize: uncompressedSize,
 	}
-	uncompressed, err := DecompressPayload(msg, opts)
+	uncompressed, err := DecompressPayload((*b)[0:msglen], opts)
 	if err != nil {
 		return nil, err
 	}
+	wm = append(wm, uncompressed...)
 
-	return append(header, uncompressed...), nil
+	return wm, nil
 }
 
-func (op Operation) createWireMessage(ctx context.Context, dst []byte,
-	desc description.SelectedServer, conn Connection) ([]byte, startedInformation, error) {
+func (op Operation) createWireMessage(
+	ctx context.Context,
+	dst []byte,
+	desc description.SelectedServer,
+	maxTimeMS uint64,
+	conn Connection) ([]byte, startedInformation, error) {
 
-	if desc.WireVersion == nil || desc.WireVersion.Max < wiremessage.OpmsgWireVersion {
-		return op.createQueryWireMessage(dst, desc)
+	// If topology is not LoadBalanced, API version is not declared, and wire version is unknown
+	// or less than 6, use OP_QUERY. Otherwise, use OP_MSG.
+	if desc.Kind != description.LoadBalanced && op.ServerAPI == nil &&
+		(desc.WireVersion == nil || desc.WireVersion.Max < wiremessage.OpmsgWireVersion) {
+		return op.createQueryWireMessage(maxTimeMS, dst, desc)
 	}
-	return op.createMsgWireMessage(ctx, dst, desc, conn)
+	return op.createMsgWireMessage(ctx, maxTimeMS, dst, desc, conn)
 }
 
 func (op Operation) addBatchArray(dst []byte) []byte {
@@ -811,9 +1027,9 @@ func (op Operation) addBatchArray(dst []byte) []byte {
 	return dst
 }
 
-func (op Operation) createQueryWireMessage(dst []byte, desc description.SelectedServer) ([]byte, startedInformation, error) {
+func (op Operation) createQueryWireMessage(maxTimeMS uint64, dst []byte, desc description.SelectedServer) ([]byte, startedInformation, error) {
 	var info startedInformation
-	flags := op.slaveOK(desc)
+	flags := op.secondaryOK(desc)
 	var wmindex int32
 	info.requestID = wiremessage.NextRequestID()
 	wmindex, dst = wiremessage.AppendHeaderStart(dst, info.requestID, 0, wiremessage.OpQuery)
@@ -826,7 +1042,7 @@ func (op Operation) createQueryWireMessage(dst []byte, desc description.Selected
 	dst = wiremessage.AppendQueryNumberToReturn(dst, -1)
 
 	wrapper := int32(-1)
-	rp, err := op.createReadPref(desc.Server.Kind, desc.Kind, true)
+	rp, err := op.createReadPref(desc, true)
 	if err != nil {
 		return dst, info, err
 	}
@@ -861,6 +1077,11 @@ func (op Operation) createQueryWireMessage(dst []byte, desc description.Selected
 
 	dst = op.addClusterTime(dst, desc)
 	dst = op.addServerAPI(dst)
+	// If maxTimeMS is greater than 0 append it to wire message. A maxTimeMS value of 0 only explicitly
+	// specifies the default behavior of no timeout server-side.
+	if maxTimeMS > 0 {
+		dst = bsoncore.AppendInt64Element(dst, "maxTimeMS", int64(maxTimeMS))
+	}
 
 	dst, _ = bsoncore.AppendDocumentEnd(dst, idx)
 	// Command monitoring only reports the document inside $query
@@ -878,7 +1099,7 @@ func (op Operation) createQueryWireMessage(dst []byte, desc description.Selected
 	return bsoncore.UpdateLength(dst, wmindex, int32(len(dst[wmindex:]))), info, nil
 }
 
-func (op Operation) createMsgWireMessage(ctx context.Context, dst []byte, desc description.SelectedServer,
+func (op Operation) createMsgWireMessage(ctx context.Context, maxTimeMS uint64, dst []byte, desc description.SelectedServer,
 	conn Connection) ([]byte, startedInformation, error) {
 
 	var info startedInformation
@@ -922,9 +1143,14 @@ func (op Operation) createMsgWireMessage(ctx context.Context, dst []byte, desc d
 
 	dst = op.addClusterTime(dst, desc)
 	dst = op.addServerAPI(dst)
+	// If maxTimeMS is greater than 0 append it to wire message. A maxTimeMS value of 0 only explicitly
+	// specifies the default behavior of no timeout server-side.
+	if maxTimeMS > 0 {
+		dst = bsoncore.AppendInt64Element(dst, "maxTimeMS", int64(maxTimeMS))
+	}
 
 	dst = bsoncore.AppendStringElement(dst, "$db", op.Database)
-	rp, err := op.createReadPref(desc.Server.Kind, desc.Kind, false)
+	rp, err := op.createReadPref(desc, false)
 	if err != nil {
 		return dst, info, err
 	}
@@ -1126,6 +1352,40 @@ func (op Operation) addClusterTime(dst []byte, desc description.SelectedServer) 
 	// return bsoncore.AppendDocumentElement(dst, "$clusterTime", clusterTime)
 }
 
+// calculateMaxTimeMS calculates the value of the 'maxTimeMS' field to potentially append
+// to the wire message based on the current context's deadline and the 90th percentile RTT
+// if the ctx is a Timeout context. If the context is not a Timeout context, it uses the
+// operation's MaxTimeMS if set. If no MaxTimeMS is set on the operation, and context is
+// not a Timeout context, calculateMaxTimeMS returns 0.
+func (op Operation) calculateMaxTimeMS(ctx context.Context, rtt90 time.Duration, rttStats string) (uint64, error) {
+	if internal.IsTimeoutContext(ctx) {
+		if deadline, ok := ctx.Deadline(); ok {
+			remainingTimeout := time.Until(deadline)
+			maxTime := remainingTimeout - rtt90
+
+			// Always round up to the next millisecond value so we never truncate the calculated
+			// maxTimeMS value (e.g. 400 microseconds evaluates to 1ms, not 0ms).
+			maxTimeMS := int64((maxTime + (time.Millisecond - 1)) / time.Millisecond)
+			if maxTimeMS <= 0 {
+				return 0, internal.WrapErrorf(ErrDeadlineWouldBeExceeded,
+					"remaining time %v until context deadline is less than or equal to 90th percentile RTT\n%v",
+					remainingTimeout, rttStats)
+			}
+			return uint64(maxTimeMS), nil
+		}
+	} else if op.MaxTime != nil {
+		// Users are not allowed to pass a negative value as MaxTime. A value of 0 would indicate
+		// no timeout and is allowed.
+		if *op.MaxTime < 0 {
+			return 0, ErrNegativeMaxTime
+		}
+		// Always round up to the next millisecond value so we never truncate the requested
+		// MaxTime value (e.g. 400 microseconds evaluates to 1ms, not 0ms).
+		return uint64((*op.MaxTime + (time.Millisecond - 1)) / time.Millisecond), nil
+	}
+	return 0, nil
+}
+
 // updateClusterTimes updates the cluster times for the session and cluster clock attached to this
 // operation. While the session's AdvanceClusterTime may return an error, this method does not
 // because an error being returned from this method will not be returned further up.
@@ -1185,9 +1445,17 @@ func (op Operation) getReadPrefBasedOnTransaction() (*readpref.ReadPref, error) 
 	return op.ReadPreference, nil
 }
 
-func (op Operation) createReadPref(serverKind description.ServerKind, topologyKind description.TopologyKind, isOpQuery bool) (bsoncore.Document, error) {
-	if serverKind == description.Standalone || (isOpQuery && serverKind != description.Mongos) || op.Type == Write {
-		// Don't send read preference for non-mongos when using OP_QUERY or for all standalones
+func (op Operation) createReadPref(desc description.SelectedServer, isOpQuery bool) (bsoncore.Document, error) {
+	// TODO(GODRIVER-2231): Instead of checking if isOutputAggregate and desc.Server.WireVersion.Max < 13, somehow check
+	// TODO if supplied readPreference was "overwritten" with primary in description.selectForReplicaSet.
+	if desc.Server.Kind == description.Standalone || (isOpQuery && desc.Server.Kind != description.Mongos) ||
+		op.Type == Write || (op.IsOutputAggregate && desc.Server.WireVersion.Max < 13) {
+		// Don't send read preference for:
+		// 1. all standalones
+		// 2. non-mongos when using OP_QUERY
+		// 3. all writes
+		// 4. when operation is an aggregate with an output stage, and selected server's wire
+		//    version is < 13
 		return nil, nil
 	}
 
@@ -1198,7 +1466,7 @@ func (op Operation) createReadPref(serverKind description.ServerKind, topologyKi
 	}
 
 	if rp == nil {
-		if topologyKind == description.Single && serverKind != description.Mongos {
+		if desc.Kind == description.Single && desc.Server.Kind != description.Mongos {
 			doc = bsoncore.AppendStringElement(doc, "mode", "primaryPreferred")
 			doc, _ = bsoncore.AppendDocumentEnd(doc, idx)
 			return doc, nil
@@ -1208,10 +1476,10 @@ func (op Operation) createReadPref(serverKind description.ServerKind, topologyKi
 
 	switch rp.Mode() {
 	case readpref.PrimaryMode:
-		if serverKind == description.Mongos {
+		if desc.Server.Kind == description.Mongos {
 			return nil, nil
 		}
-		if topologyKind == description.Single {
+		if desc.Kind == description.Single {
 			doc = bsoncore.AppendStringElement(doc, "mode", "primaryPreferred")
 			doc, _ = bsoncore.AppendDocumentEnd(doc, idx)
 			return doc, nil
@@ -1221,7 +1489,7 @@ func (op Operation) createReadPref(serverKind description.ServerKind, topologyKi
 		doc = bsoncore.AppendStringElement(doc, "mode", "primaryPreferred")
 	case readpref.SecondaryPreferredMode:
 		_, ok := rp.MaxStaleness()
-		if serverKind == description.Mongos && isOpQuery && !ok && len(rp.TagSets()) == 0 && rp.HedgeEnabled() == nil {
+		if desc.Server.Kind == description.Mongos && isOpQuery && !ok && len(rp.TagSets()) == 0 && rp.HedgeEnabled() == nil {
 			return nil, nil
 		}
 		doc = bsoncore.AppendStringElement(doc, "mode", "secondaryPreferred")
@@ -1267,20 +1535,20 @@ func (op Operation) createReadPref(serverKind description.ServerKind, topologyKi
 	return doc, nil
 }
 
-func (op Operation) slaveOK(desc description.SelectedServer) wiremessage.QueryFlag {
+func (op Operation) secondaryOK(desc description.SelectedServer) wiremessage.QueryFlag {
 	if desc.Kind == description.Single && desc.Server.Kind != description.Mongos {
-		return wiremessage.SlaveOK
+		return wiremessage.SecondaryOK
 	}
 
 	if rp := op.ReadPreference; rp != nil && rp.Mode() != readpref.PrimaryMode {
-		return wiremessage.SlaveOK
+		return wiremessage.SecondaryOK
 	}
 
 	return 0
 }
 
 func (Operation) canCompress(cmd string) bool {
-	if cmd == "isMaster" || cmd == "saslStart" || cmd == "saslContinue" || cmd == "getnonce" || cmd == "authenticate" ||
+	if cmd == internal.LegacyHello || cmd == "hello" || cmd == "saslStart" || cmd == "saslContinue" || cmd == "getnonce" || cmd == "authenticate" ||
 		cmd == "createUser" || cmd == "updateUser" || cmd == "copydbSaslStart" || cmd == "copydbgetnonce" || cmd == "copydb" {
 		return false
 	}
@@ -1436,11 +1704,11 @@ func (op *Operation) redactCommand(cmd string, doc bsoncore.Document) bool {
 
 		return true
 	}
-	if strings.ToLower(cmd) != "ismaster" && cmd != "hello" {
+	if strings.ToLower(cmd) != internal.LegacyHelloLowercase && cmd != "hello" {
 		return false
 	}
 
-	// An isMaster without speculative authentication can be monitored.
+	// A hello without speculative authentication can be monitored.
 	_, err := doc.LookupErr("speculativeAuthenticate")
 	return err == nil
 }
@@ -1467,12 +1735,13 @@ func (op Operation) publishStartedEvent(ctx context.Context, info startedInforma
 	}
 
 	started := &event.CommandStartedEvent{
-		Command:      cmdCopy,
-		DatabaseName: op.Database,
-		CommandName:  info.cmdName,
-		RequestID:    int64(info.requestID),
-		ConnectionID: info.connID,
-		ServiceID:    info.serviceID,
+		Command:            cmdCopy,
+		DatabaseName:       op.Database,
+		CommandName:        info.cmdName,
+		RequestID:          int64(info.requestID),
+		ConnectionID:       info.connID,
+		ServerConnectionID: info.serverConnID,
+		ServiceID:          info.serviceID,
 	}
 	op.CommandMonitor.Started(ctx, started)
 }
@@ -1491,23 +1760,23 @@ func (op Operation) publishFinishedEvent(ctx context.Context, info finishedInfor
 	var durationNanos int64
 	var emptyTime time.Time
 	if info.startTime != emptyTime {
-		durationNanos = time.Now().Sub(info.startTime).Nanoseconds()
+		durationNanos = time.Since(info.startTime).Nanoseconds()
 	}
 
 	finished := event.CommandFinishedEvent{
-		CommandName:   info.cmdName,
-		RequestID:     int64(info.requestID),
-		ConnectionID:  info.connID,
-		DurationNanos: durationNanos,
-		ServiceID:     info.serviceID,
+		CommandName:        info.cmdName,
+		RequestID:          int64(info.requestID),
+		ConnectionID:       info.connID,
+		DurationNanos:      durationNanos,
+		ServerConnectionID: info.serverConnID,
+		ServiceID:          info.serviceID,
 	}
 
 	if success {
 		res := bson.Raw{}
 		// Only copy the reply for commands that are not security sensitive
 		if !info.redacted {
-			res = make([]byte, len(info.response))
-			copy(res, info.response)
+			res = bson.Raw(info.response)
 		}
 		successEvent := &event.CommandSucceededEvent{
 			Reply:                res,
